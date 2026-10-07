@@ -2,12 +2,14 @@
  * useCoverage：按样带或站位汇总珊瑚覆盖率、白化占比与鱼类密度。
  * 被珊瑚计数页（/belts/:id/corals）、鱼类计数页（/belts/:id/fishes）
  * 与覆盖度汇总页（/coverage）消费。
+ * 属名归并按名录定名（catalogStore.resolver），与导出走同一口径。
  */
 import { computed, type ComputedRef } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useCatalogStore } from '@/stores/catalogStore'
 import type { BleachLevel, CoralRecord, CoralForm } from '@/types/coralRecord'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
@@ -18,9 +20,9 @@ import {
   coralCoveragePct,
   fishDensity,
   groupByForm,
-  groupByGenus,
   round
 } from '@/utils/bleach'
+import { groupByResolvedGenus, type ResolvedGenusGroup } from '@/utils/taxonomy'
 
 /** 单条样带的覆盖度成果 */
 export interface BeltCoverage {
@@ -45,8 +47,8 @@ export interface BeltCoverage {
   bleachedSharePct: number
   /** 各白化等级累计覆盖长度 */
   distribution: Record<BleachLevel, number>
-  /** 按属名分组的覆盖长度 */
-  byGenus: Array<{ genus: string; coverCm: number }>
+  /** 按名录定名归并的属名覆盖（待定名的按外业原名计入并标记） */
+  byGenus: ResolvedGenusGroup[]
   /** 按形态分组的覆盖长度 */
   byForm: Array<{ form: CoralForm; coverCm: number }>
   fishTotal: number
@@ -111,16 +113,19 @@ const BLEACH_WEIGHT_ORDER: Record<BleachLevel, number> = {
 const EMPTY_DISTRIBUTION = (): Record<BleachLevel, number> => ({ 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 })
 
 /**
- * 组合式函数：基于三个 store 的响应式列表派生覆盖度、白化占比与鱼类密度。
+ * 组合式函数：基于 reef / belt / survey / catalog 四个 store 的响应式列表
+ * 派生覆盖度、白化占比与鱼类密度；属名归并随名录修订发布自动更新。
  */
 export function useCoverage(): UseCoverageResult {
   const reefStore = useReefStore()
   const beltStore = useBeltStore()
   const surveyStore = useSurveyStore()
+  const catalogStore = useCatalogStore()
 
   const { reefs, sites } = storeToRefs(reefStore)
   const { belts } = storeToRefs(beltStore)
   const { corals, fishes } = storeToRefs(surveyStore)
+  const { resolver } = storeToRefs(catalogStore)
 
   const siteOf = (siteId: string) => sites.value.find((site) => site.id === siteId) ?? null
   const reefOf = (reefId: string) => reefs.value.find((reef) => reef.id === reefId) ?? null
@@ -166,7 +171,7 @@ export function useCoverage(): UseCoverageResult {
       grade: bleachGrade(index),
       bleachedSharePct: bleachedSharePct(beltCorals),
       distribution,
-      byGenus: groupByGenus(beltCorals),
+      byGenus: groupByResolvedGenus(beltCorals, resolver.value),
       byForm: groupByForm(beltCorals),
       fishTotal,
       invertebrateTotal,

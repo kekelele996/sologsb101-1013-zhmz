@@ -11,9 +11,12 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { CatalogMeta, GenusRevision, TaxonEntry } from '@/types/catalog'
+import { CATALOG_INITIAL_VERSION, CATALOG_META_ID } from '@/types/catalog'
+import { planPendingRevisionGenera } from '@/utils/taxonomy'
 
-/** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+/** 当前数据结构版本号：每次调整字段结构必须与历史版本号连续递增并补迁移 */
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -35,6 +38,12 @@ export interface BackupPayload {
   belts: Belt[]
   corals: CoralRecord[]
   fishes: FishCount[]
+  /** 名录侧：分类名录条目 */
+  taxa: TaxonEntry[]
+  /** 名录侧：属名修订条目 */
+  revisions: GenusRevision[]
+  /** 名录侧：修订版本号（旧备份没有时为 null，导入后按现有属名补挂待修订） */
+  catalogMeta: CatalogMeta | null
 }
 
 export class CoralBeltDatabase extends Dexie {
@@ -43,6 +52,12 @@ export class CoralBeltDatabase extends Dexie {
   belts!: Table<Belt, string>
   corals!: Table<CoralRecord, string>
   fishes!: Table<FishCount, string>
+  /** 名录室侧：分类名录 */
+  taxa!: Table<TaxonEntry, string>
+  /** 名录室侧：属名修订条目 */
+  revisions!: Table<GenusRevision, string>
+  /** 名录室侧：修订版本号（单行） */
+  catalogMeta!: Table<CatalogMeta, string>
 
   constructor() {
     super(DB_NAME)
@@ -57,7 +72,7 @@ export class CoralBeltDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（位置/面积、经纬度/水深、样带长度与朝向、白化等级、类别）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
         sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
@@ -84,6 +99,53 @@ export class CoralBeltDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
               Object.assign(row, factory())
             })
+        }
+      })
+
+    // v3：名录室单独立侧——新增分类名录、属名修订条目与修订版本号三表。
+    // 旧数据没有名录版本：升级时按 corals 表现有属名各挂一条「待修订」，并补名录版本 v1。
+    this.version(3)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt',
+        taxa: 'id, acceptedGenus, status, updatedAt',
+        revisions: 'id, fromGenus, status, kind, updatedAt',
+        catalogMeta: 'id'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const corals = (await tx.table('corals').toArray()) as CoralRecord[]
+        const taxa = (await tx.table('taxa').toArray()) as TaxonEntry[]
+        const revisions = (await tx.table('revisions').toArray()) as GenusRevision[]
+        const pending = planPendingRevisionGenera(
+          corals.map((coral) => coral.genus),
+          revisions,
+          taxa
+        )
+        if (pending.length > 0) {
+          const rows: GenusRevision[] = pending.map((genus, index) => ({
+            id: createId('rev'),
+            fromGenus: genus,
+            toGenus: null,
+            kind: '新录',
+            status: '待修订',
+            version: null,
+            failureReason: null,
+            createdAt: now + index,
+            updatedAt: now + index
+          }))
+          await tx.table('revisions').bulkPut(rows)
+        }
+        const meta = (await tx.table('catalogMeta').get(CATALOG_META_ID)) as CatalogMeta | undefined
+        if (!meta) {
+          await tx.table('catalogMeta').put({
+            id: CATALOG_META_ID,
+            version: CATALOG_INITIAL_VERSION,
+            updatedAt: now
+          })
         }
       })
   }
@@ -350,32 +412,90 @@ export async function initDatabase(): Promise<void> {
   if (count === 0) {
     await seedDemoData()
   }
+  // 名录侧兜底：新装播种或旧备份导入后，把没挂账的外业属名补挂「待修订」并补名录版本
+  await ensurePendingRevisions()
   stampDbVersion()
 }
 
-/** 清空全部业务表（导入覆盖与重置共用） */
-export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await Promise.all([db.reefs.clear(), db.sites.clear(), db.belts.clear(), db.corals.clear(), db.fishes.clear()])
+/**
+ * 幂等挂账：外业 corals 里出现、但名录侧（名录条目 + 修订条目）没有任何记录的属名，
+ * 各挂一条「待修订」；名录版本元数据缺失时补 v1。
+ * 升级迁移、首屏播种、追加导入与对账页「一键挂账」共用本函数。
+ */
+export async function ensurePendingRevisions(): Promise<number> {
+  return db.transaction('rw', [db.corals, db.taxa, db.revisions, db.catalogMeta], async () => {
+    const now = Date.now()
+    const [corals, taxa, revisions] = await Promise.all([
+      db.corals.toArray(),
+      db.taxa.toArray(),
+      db.revisions.toArray()
+    ])
+    const pending = planPendingRevisionGenera(
+      corals.map((coral) => coral.genus),
+      revisions,
+      taxa
+    )
+    if (pending.length > 0) {
+      const rows: GenusRevision[] = pending.map((genus, index) => ({
+        id: createId('rev'),
+        fromGenus: genus,
+        toGenus: null,
+        kind: '新录',
+        status: '待修订',
+        version: null,
+        failureReason: null,
+        createdAt: now + index,
+        updatedAt: now + index
+      }))
+      await db.revisions.bulkPut(rows)
+    }
+    const meta = await db.catalogMeta.get(CATALOG_META_ID)
+    if (!meta) {
+      await db.catalogMeta.put({ id: CATALOG_META_ID, version: CATALOG_INITIAL_VERSION, updatedAt: now })
+    }
+    return pending.length
   })
 }
 
-/** 清空并重新播种演示数据 */
+/** 清空全部业务表（导入覆盖与重置共用），名录侧三表一并清空 */
+export async function clearAllTables(): Promise<void> {
+  await db.transaction(
+    'rw',
+    [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.taxa, db.revisions, db.catalogMeta],
+    async () => {
+      await Promise.all([
+        db.reefs.clear(),
+        db.sites.clear(),
+        db.belts.clear(),
+        db.corals.clear(),
+        db.fishes.clear(),
+        db.taxa.clear(),
+        db.revisions.clear(),
+        db.catalogMeta.clear()
+      ])
+    }
+  )
+}
+
+/** 清空并重新播种演示数据（名录侧同步重建待修订挂账） */
 export async function resetDatabase(): Promise<void> {
   await clearAllTables()
   await seedDemoData()
+  await ensurePendingRevisions()
 }
 
 /** 统计各表行数，供页脚概览与覆盖度页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, taxa, revisions] = await Promise.all([
     db.reefs.count(),
     db.sites.count(),
     db.belts.count(),
     db.corals.count(),
-    db.fishes.count()
+    db.fishes.count(),
+    db.taxa.count(),
+    db.revisions.count()
   ])
-  return { reefs, sites, belts, corals, fishes }
+  return { reefs, sites, belts, corals, fishes, taxa, revisions }
 }
 
 /** 写入结构版本号到 localStorage，便于覆盖度页比对 */

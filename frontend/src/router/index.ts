@@ -3,6 +3,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 /**
  * 路由表：路径与提示词逐字一致。
  * /reefs、/reefs/:id/sites、/sites/:id/belts、/belts/:id/corals、/belts/:id/fishes、/coverage
+ * 名录室单独立侧：/catalog（分类名录、属名修订条目与修订版本号）。
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -12,6 +13,12 @@ const routes: RouteRecordRaw[] = [
     name: 'reef-list',
     component: () => import('@/pages/ReefList.vue'),
     meta: { title: '礁区台账', icon: 'Odometer' }
+  },
+  {
+    path: '/catalog',
+    name: 'catalog-board',
+    component: () => import('@/pages/CatalogBoard.vue'),
+    meta: { title: '分类名录室', icon: 'Collection' }
   },
   {
     path: '/reefs/:id/sites',

@@ -16,6 +16,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useCatalogStore } from '@/stores/catalogStore'
 import {
   BLEACH_LEVELS,
   COMMON_GENERA,
@@ -23,7 +24,8 @@ import {
   parseCoralPaste
 } from '@/types/coralRecord'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
-import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm, groupByGenus } from '@/utils/bleach'
+import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm } from '@/utils/bleach'
+import { groupByResolvedGenus } from '@/utils/taxonomy'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -31,6 +33,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const catalogStore = useCatalogStore()
 
 const beltId = computed(() => String(route.params.id ?? ''))
 const belt = computed(() => beltStore.beltById(beltId.value))
@@ -54,14 +57,18 @@ const form = reactive({
 
 const records = computed(() => surveyStore.coralsOfBelt(beltId.value))
 
-/** 按属名分组汇总 */
-const genusGroups = computed(() =>
-  groupByGenus(records.value).map((group) => {
-    const list = records.value.filter((record) => record.genus === group.genus)
+/**
+ * 按名录定名归并属名分组：已发布修订的属名归到定名；
+ * 名录还没改到的按外业原名照常计入并标记「待定名」，与汇总页 / 导出同一口径。
+ */
+const genusGroups = computed(() => {
+  const resolve = catalogStore.resolver
+  return groupByResolvedGenus(records.value, resolve).map((group) => {
+    const list = records.value.filter((record) => resolve(record.genus).genus === group.genus)
     const index = bleachIndex(list)
     return { ...group, count: list.length, bleachIndex: index, grade: bleachGrade(index) }
   })
-)
+})
 
 /** 按形态分组汇总 */
 const formGroups = computed(() => groupByForm(records.value))
@@ -307,10 +314,13 @@ onMounted(() => {
         </div>
         <div class="page__grid">
           <div>
-            <h4 class="page__sub">按属名分组（覆盖长度 cm）</h4>
+            <h4 class="page__sub">按属名分组（覆盖长度 cm，按名录定名归并）</h4>
             <div class="gb-bars">
               <div v-for="group in genusGroups" :key="group.genus" class="gb-bar">
-                <span>{{ group.genus }}</span>
+                <span>
+                  {{ group.genus }}
+                  <el-tag v-if="!group.cataloged" size="small" type="warning" effect="plain">待定名</el-tag>
+                </span>
                 <span class="gb-bar__track">
                   <span
                     class="gb-bar__fill"
@@ -320,6 +330,9 @@ onMounted(() => {
                 <span class="gb-mono">
                   {{ group.coverCm }} cm · {{ group.count }} 条
                   <BleachTag :level="group.grade" size="small" :plain="true" />
+                </span>
+                <span v-if="group.fromGenera.length > 1" class="gb-hint page__alias">
+                  归并外业原名：{{ group.fromGenera.join('、') }}
                 </span>
               </div>
             </div>
@@ -515,6 +528,11 @@ onMounted(() => {
   margin: 0 0 8px;
   font-size: 13px;
   color: #4c6663;
+}
+
+.page__alias {
+  flex-basis: 100%;
+  font-size: 11px;
 }
 
 .page__bulk {

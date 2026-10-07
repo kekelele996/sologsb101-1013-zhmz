@@ -1,6 +1,7 @@
 /**
  * 备份导入导出：整库 JSON 快照的组装、校验、下载与导入；
  * 以及按礁区/站位汇总的覆盖度结论生成。
+ * 属名归并与页面汇总走同一口径（utils/taxonomy.ts 的 buildGenusResolver）。
  */
 import {
   db,
@@ -8,6 +9,7 @@ import {
   DB_VERSION,
   createId,
   clearAllTables,
+  ensurePendingRevisions,
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
@@ -15,22 +17,30 @@ import {
   BLEACH_LEVELS,
   type BleachLevel
 } from '@/types/coralRecord'
+import { CATALOG_INITIAL_VERSION, CATALOG_META_ID } from '@/types/catalog'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { buildGenusResolver, groupByResolvedGenus, type ResolvedGenusGroup } from '@/utils/taxonomy'
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
+/** 备份集合键名（数组表；catalogMeta 为单行对象，单独处理） */
+export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes', 'taxa', 'revisions'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
+
+/** 旧版备份必有的五张表（缺失即拒绝导入） */
+const REQUIRED_KEYS: BackupKey[] = ['reefs', 'sites', 'belts', 'corals', 'fishes']
 
 export type CountMap = Record<BackupKey, number>
 
-/** 组装当前本地数据的完整快照 */
+/** 组装当前本地数据的完整快照（含名录侧三表，与页面汇总同一定名口径） */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, taxa, revisions, catalogMeta] = await Promise.all([
     db.reefs.toArray(),
     db.sites.toArray(),
     db.belts.toArray(),
     db.corals.toArray(),
-    db.fishes.toArray()
+    db.fishes.toArray(),
+    db.taxa.toArray(),
+    db.revisions.toArray(),
+    db.catalogMeta.get(CATALOG_META_ID)
   ])
   return {
     app: 'gbcoralbelt',
@@ -40,11 +50,14 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     sites,
     belts,
     corals,
-    fishes
+    fishes,
+    taxa,
+    revisions,
+    catalogMeta: catalogMeta ?? null
   }
 }
 
-/** 校验外部 JSON 是否为本站可识别的备份文件 */
+/** 校验外部 JSON 是否为本站可识别的备份文件（旧备份没有名录三表时按空名录容忍） */
 export function validateBackup(input: unknown): { ok: boolean; errors: string[]; payload: BackupPayload | null } {
   const errors: string[] = []
   if (typeof input !== 'object' || input === null) {
@@ -54,8 +67,11 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== undefined && obj.app !== 'gbcoralbelt') {
     errors.push('app 字段应为 gbcoralbelt，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  for (const key of REQUIRED_KEYS) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
+  }
+  for (const key of ['taxa', 'revisions'] as const) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) errors.push(`${key} 字段不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const payload: BackupPayload = {
@@ -66,7 +82,10 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     sites: obj.sites ?? [],
     belts: obj.belts ?? [],
     corals: obj.corals ?? [],
-    fishes: obj.fishes ?? []
+    fishes: obj.fishes ?? [],
+    taxa: obj.taxa ?? [],
+    revisions: obj.revisions ?? [],
+    catalogMeta: obj.catalogMeta ?? null
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +97,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     sites: payload.sites.length,
     belts: payload.belts.length,
     corals: payload.corals.length,
-    fishes: payload.fishes.length
+    fishes: payload.fishes.length,
+    taxa: payload.taxa.length,
+    revisions: payload.revisions.length
   }
 }
 
@@ -111,16 +132,46 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
-/** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
+/**
+ * 导入快照：overwrite=true 先清空全部表，否则按主键合并。
+ * 名录侧幂等：追加模式下同名名录条目 / 同原属名修订条目跳过，版本号保留本库；
+ * 导入完成后统一补挂待修订（旧备份没有名录数据时也能立刻对账）。
+ */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await db.reefs.bulkPut(payload.reefs)
-    await db.sites.bulkPut(payload.sites)
-    await db.belts.bulkPut(payload.belts)
-    await db.corals.bulkPut(payload.corals)
-    await db.fishes.bulkPut(payload.fishes)
-  })
+  await db.transaction(
+    'rw',
+    [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.taxa, db.revisions, db.catalogMeta],
+    async () => {
+      await db.reefs.bulkPut(payload.reefs)
+      await db.sites.bulkPut(payload.sites)
+      await db.belts.bulkPut(payload.belts)
+      await db.corals.bulkPut(payload.corals)
+      await db.fishes.bulkPut(payload.fishes)
+      if (overwrite) {
+        await db.taxa.bulkPut(payload.taxa)
+        await db.revisions.bulkPut(payload.revisions)
+        await db.catalogMeta.put(
+          payload.catalogMeta ?? {
+            id: CATALOG_META_ID,
+            version: CATALOG_INITIAL_VERSION,
+            updatedAt: Date.now()
+          }
+        )
+      } else {
+        const knownTaxa = new Set((await db.taxa.toArray()).map((row) => row.acceptedGenus.trim()))
+        const knownRevisions = new Set((await db.revisions.toArray()).map((row) => row.fromGenus.trim()))
+        await db.taxa.bulkPut(payload.taxa.filter((row) => !knownTaxa.has(row.acceptedGenus.trim())))
+        await db.revisions.bulkPut(payload.revisions.filter((row) => !knownRevisions.has(row.fromGenus.trim())))
+        const meta = await db.catalogMeta.get(CATALOG_META_ID)
+        if (!meta) {
+          await db.catalogMeta.put({ id: CATALOG_META_ID, version: CATALOG_INITIAL_VERSION, updatedAt: Date.now() })
+        }
+      }
+    }
+  )
+  // 导入数据里没挂账的外业属名各挂一条待修订（与升级迁移同一口径）
+  await ensurePendingRevisions()
   return countPayload(payload)
 }
 
@@ -155,7 +206,10 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('fsh'),
     beltId: beltMap.get(fish.beltId) ?? fish.beltId
   }))
-  return { ...payload, reefs, sites, belts, corals, fishes }
+  // 名录侧只重发主键，属名对应关系不变；版本号保留本库（catalogMeta: null 由导入侧忽略）
+  const taxa = payload.taxa.map((taxon) => ({ ...taxon, id: createId('tax') }))
+  const revisions = payload.revisions.map((revision) => ({ ...revision, id: createId('rev') }))
+  return { ...payload, reefs, sites, belts, corals, fishes, taxa, revisions, catalogMeta: null }
 }
 
 /** 白化等级分布：各等级累计覆盖长度 */
@@ -184,6 +238,8 @@ export interface CoverageLine {
   /** 白化占比（%，覆盖长度加权） */
   bleachedSharePct: number
   distribution: BleachDistribution
+  /** 按名录定名归并的属名覆盖（与页面汇总同一口径；待定名的按外业原名计入并标记） */
+  byGenus: ResolvedGenusGroup[]
   fishTotal: number
   invertebrateTotal: number
   /** 鱼类密度（尾 / 100 m²） */
@@ -191,8 +247,9 @@ export interface CoverageLine {
   conclusion: string
 }
 
-/** 按样带生成覆盖度结论行 */
+/** 按样带生成覆盖度结论行（属名归并用快照内的名录数据，与页面同一 resolver） */
 export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
+  const resolve = buildGenusResolver(payload.revisions, payload.taxa)
   const reefById = new Map(payload.reefs.map((reef) => [reef.id, reef]))
   const siteById = new Map(payload.sites.map((site) => [site.id, site]))
   const coralsByBelt = new Map<string, typeof payload.corals>()
@@ -249,6 +306,7 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
         grade,
         bleachedSharePct: bleachedSharePct(corals),
         distribution,
+        byGenus: groupByResolvedGenus(corals, resolve),
         fishTotal,
         invertebrateTotal,
         fishDensity: fishDensity(fishTotal, belt.lengthM),
@@ -277,7 +335,10 @@ export interface ReefSummary {
   fishTotal: number
 }
 
-export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]): ReefSummary[] {
+export function buildReefSummaries(
+  payload: BackupPayload,
+  lines: Array<Pick<CoverageLine, 'reefId' | 'bleachIndex'>>
+): ReefSummary[] {
   return payload.reefs.map((reef) => {
     const siteIds = new Set(payload.sites.filter((site) => site.reefId === reef.id).map((site) => site.id))
     const beltIds = new Set(payload.belts.filter((belt) => siteIds.has(belt.siteId)).map((belt) => belt.id))
