@@ -17,6 +17,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useCatalogStore } from '@/stores/catalogStore'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { BleachLevel } from '@/types/coralRecord'
 import { BLEACH_COLOR } from '@/utils/bleach'
@@ -45,8 +46,9 @@ const route = useRoute()
 const router = useRouter()
 const reefStore = useReefStore()
 const surveyStore = useSurveyStore()
+const catalogStore = useCatalogStore()
 
-const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0 }
+const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0, taxa: 0, revisions: 0 }
 
 const counts = ref<CountMap>(EMPTY_COUNTS)
 const lastBackupAt = ref<string | null>(null)
@@ -94,6 +96,11 @@ const distributionTotal = computed(() =>
   BLEACH_LEVELS.reduce((sum, level) => sum + distribution.value[level], 0)
 )
 
+/** 名录还没改到的外业属名：照常计入本页汇总，标出来等名录室定名 */
+const pendingGenera = computed<string[]>(() =>
+  catalogStore.fieldGenera.filter((genus) => catalogStore.resolveGenus(genus).pending)
+)
+
 function barPercent(value: number, total: number): string {
   if (!Number.isFinite(total) || total <= 0) return '0%'
   return `${Math.min(100, (value / total) * 100).toFixed(1)}%`
@@ -104,29 +111,7 @@ async function refresh(): Promise<void> {
   lastBackupAt.value = readLastBackupAt()
   stampedVersion.value = readStampedDbVersion()
   const payload = await buildBackupPayload()
-  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows.map((row) => ({
-    beltId: row.beltId,
-    beltNo: row.beltNo,
-    reefId: row.reefId,
-    reefName: row.reefName,
-    siteId: row.siteId,
-    siteNo: row.siteNo,
-    lengthM: row.lengthM,
-    orientation: row.orientation,
-    surveyDate: row.surveyDate,
-    observer: row.observer,
-    coralCount: row.coralCount,
-    coverCmTotal: row.coverCmTotal,
-    coveragePct: row.coveragePct,
-    bleachIndex: row.bleachIndex,
-    grade: row.grade,
-    bleachedSharePct: row.bleachedSharePct,
-    distribution: row.distribution,
-    fishTotal: row.fishTotal,
-    invertebrateTotal: row.invertebrateTotal,
-    fishDensity: row.fishDensity,
-    conclusion: ''
-  })))
+  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows)
 }
 
 function handleFilterChange(): void {
@@ -249,7 +234,8 @@ onMounted(() => {
       <div>
         <h2 class="page__title">白化等级评定与覆盖度汇总</h2>
         <p class="gb-hint">
-          按样带汇总珊瑚覆盖率、白化指数（按覆盖长度加权，0 ~ 4）与鱼类密度，并可按礁区、白化等级筛选；同时提供结构版本查看与 JSON 导入导出。
+          按样带汇总珊瑚覆盖率、白化指数（按覆盖长度加权，0 ~ 4）与鱼类密度，属名按名录定名归并（待定名照常计入并标出）；
+          可按礁区、白化等级筛选，并提供结构版本查看与 JSON 导入导出。
         </p>
       </div>
       <div class="page__actions">
@@ -260,6 +246,20 @@ onMounted(() => {
     </div>
 
     <el-alert v-if="notice" type="success" :closable="false" show-icon :title="notice" />
+
+    <el-alert
+      v-if="pendingGenera.length > 0"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="`${pendingGenera.length} 个属名名录还没改到：${pendingGenera.join('、')}。已按外业名字照常计入本页汇总与导出，并标为「待定名」。`"
+    >
+      <template #default>
+        <el-button size="small" text type="warning" @click="router.push('/catalog')">
+          去名录管理处理 →
+        </el-button>
+      </template>
+    </el-alert>
 
     <div class="gb-stats-row">
       <StatBadge label="样带数" :value="totals.belts" suffix="条" icon="Files" />
@@ -440,7 +440,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>结构版本与全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 reefs / sites / belts / corals / fishes 五张表 · 最近备份
+          导出内容包含 reefs / sites / belts / corals / fishes / taxa / revisions 七张表 · 名录修订版本 v{{ catalogStore.currentRevisionVersion }} · 最近备份
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </span>
       </div>
@@ -479,6 +479,9 @@ onMounted(() => {
         <el-descriptions-item label="礁区 / 站位">{{ counts.reefs }} / {{ counts.sites }}</el-descriptions-item>
         <el-descriptions-item label="样带 / 珊瑚记录">{{ counts.belts }} / {{ counts.corals }}</el-descriptions-item>
         <el-descriptions-item label="鱼类计数">{{ counts.fishes }}</el-descriptions-item>
+        <el-descriptions-item label="名录条目 / 修订条目">{{ counts.taxa }} / {{ counts.revisions }}</el-descriptions-item>
+        <el-descriptions-item label="名录修订版本">v{{ catalogStore.currentRevisionVersion }}</el-descriptions-item>
+        <el-descriptions-item label="待定名属名">{{ pendingGenera.length }} 个</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>

@@ -11,9 +11,10 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { GenusRevision, TaxonEntry } from '@/types/catalog'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -35,6 +36,10 @@ export interface BackupPayload {
   belts: Belt[]
   corals: CoralRecord[]
   fishes: FishCount[]
+  /** 名录室：分类名录条目（v3 起；旧备份可缺省） */
+  taxa: TaxonEntry[]
+  /** 名录室：属名修订条目（v3 起；旧备份可缺省） */
+  revisions: GenusRevision[]
 }
 
 export class CoralBeltDatabase extends Dexie {
@@ -43,6 +48,8 @@ export class CoralBeltDatabase extends Dexie {
   belts!: Table<Belt, string>
   corals!: Table<CoralRecord, string>
   fishes!: Table<FishCount, string>
+  taxa!: Table<TaxonEntry, string>
+  revisions!: Table<GenusRevision, string>
 
   constructor() {
     super(DB_NAME)
@@ -57,7 +64,7 @@ export class CoralBeltDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（位置/面积、经纬度/水深、样带长度与朝向、白化等级、类别）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
         sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
@@ -85,6 +92,39 @@ export class CoralBeltDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：名录室独立建表（分类名录条目 + 属名修订条目），外业五张表结构不变
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt',
+        taxa: 'id, genus, status, updatedAt',
+        revisions: 'id, fieldGenus, acceptedGenus, status, revisionVersion, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移：旧数据没有名录版本，按现有属名各挂一条待修订，等名录室定名
+        const genera = new Set<string>()
+        await tx.table('corals').each((row: Record<string, unknown>) => {
+          const genus = typeof row.genus === 'string' ? row.genus.trim() : ''
+          if (genus.length > 0) genera.add(genus)
+        })
+        if (genera.size === 0) return
+        const now = Date.now()
+        const rows = Array.from(genera).map((fieldGenus, index) => ({
+          id: createId('rev'),
+          fieldGenus,
+          acceptedGenus: '',
+          status: 'pending',
+          revisionVersion: 0,
+          note: '结构升级迁移：旧数据无名录版本，待名录室定名',
+          createdAt: now + index,
+          updatedAt: now + index
+        }))
+        await tx.table('revisions').bulkPut(rows)
       })
   }
 }
@@ -146,6 +186,7 @@ interface SeedBelt {
 
 /**
  * 播种演示数据：3 个礁区 → 4 个站位 → 5 条样带 → 14 条珊瑚记录 + 12 条鱼类计数，
+ * 另播种名录室演示数据（10 条名录条目 + 2 条属名修订），
  * 覆盖无 / 轻 / 中 / 重 / 死亡 全部白化等级，保证每个页面打开都有内容、层级路由也能命中真实 id。
  */
 export async function seedDemoData(): Promise<void> {
@@ -314,7 +355,7 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.taxa, db.revisions], async () => {
     const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
       createdAt: now + offset,
       updatedAt: now + offset
@@ -340,7 +381,62 @@ export async function seedDemoData(): Promise<void> {
         belt.fishes.map((fish, fishIndex) => ({ ...fish, ...stamp(400 + beltIndex * 100 + fishIndex) }))
       )
     )
+    await db.taxa.bulkPut(seedTaxa().map((taxon, index) => ({ ...taxon, ...stamp(500 + index) })))
+    await db.revisions.bulkPut(seedRevisions().map((revision, index) => ({ ...revision, ...stamp(600 + index) })))
   })
+}
+
+/**
+ * 名录室演示名录：常见有效属名 + 一对拆分合并示例（石芝珊瑚属 → 蕈珊瑚属）。
+ * 故意不收录「柳珊瑚属」，演示外业暂定名待定名的归并口径。
+ */
+function seedTaxa(): Array<Omit<TaxonEntry, 'createdAt' | 'updatedAt'>> {
+  return [
+    { id: 'tax_acropora', genus: '鹿角珊瑚属', latinName: 'Acropora', status: '有效', note: '' },
+    { id: 'tax_pocillopora', genus: '杯形珊瑚属', latinName: 'Pocillopora', status: '有效', note: '' },
+    { id: 'tax_porites', genus: '滨珊瑚属', latinName: 'Porites', status: '有效', note: '' },
+    { id: 'tax_favia', genus: '蜂巢珊瑚属', latinName: 'Favia', status: '有效', note: '' },
+    { id: 'tax_montipora', genus: '蔷薇珊瑚属', latinName: 'Montipora', status: '有效', note: '' },
+    { id: 'tax_turbinaria', genus: '陀螺珊瑚属', latinName: 'Turbinaria', status: '有效', note: '' },
+    {
+      id: 'tax_cycloseris',
+      genus: '蕈珊瑚属',
+      latinName: 'Cycloseris',
+      status: '有效',
+      note: '2026 年第 1 版修订：吸纳原石芝珊瑚属近缘种类'
+    },
+    {
+      id: 'tax_fungia',
+      genus: '石芝珊瑚属',
+      latinName: 'Fungia',
+      status: '异名',
+      note: '旧名，已并入蕈珊瑚属，仅留档'
+    },
+    { id: 'tax_sinularia', genus: '软珊瑚属', latinName: 'Sinularia', status: '有效', note: '' },
+    { id: 'tax_galaxea', genus: '星珊瑚属', latinName: 'Galaxea', status: '有效', note: '' }
+  ]
+}
+
+/** 名录室演示修订：一条已定名（版本 1），一条待修订（外业暂定名） */
+function seedRevisions(): Array<Omit<GenusRevision, 'createdAt' | 'updatedAt'>> {
+  return [
+    {
+      id: 'rev_fungia_merge',
+      fieldGenus: '石芝珊瑚属',
+      acceptedGenus: '蕈珊瑚属',
+      status: 'resolved',
+      revisionVersion: 1,
+      note: '名录室 2026 年第 1 版修订：石芝珊瑚属并入蕈珊瑚属'
+    },
+    {
+      id: 'rev_gorgonia_pending',
+      fieldGenus: '柳珊瑚属',
+      acceptedGenus: '',
+      status: 'pending',
+      revisionVersion: 0,
+      note: '外业暂定名，名录尚未收录，待名录室定名'
+    }
+  ]
 }
 
 /** 打开数据库并幂等播种：仅当礁区表为空时灌入演示数据 */
@@ -355,8 +451,16 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await Promise.all([db.reefs.clear(), db.sites.clear(), db.belts.clear(), db.corals.clear(), db.fishes.clear()])
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.taxa, db.revisions], async () => {
+    await Promise.all([
+      db.reefs.clear(),
+      db.sites.clear(),
+      db.belts.clear(),
+      db.corals.clear(),
+      db.fishes.clear(),
+      db.taxa.clear(),
+      db.revisions.clear()
+    ])
   })
 }
 
@@ -368,14 +472,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与覆盖度页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, taxa, revisions] = await Promise.all([
     db.reefs.count(),
     db.sites.count(),
     db.belts.count(),
     db.corals.count(),
-    db.fishes.count()
+    db.fishes.count(),
+    db.taxa.count(),
+    db.revisions.count()
   ])
-  return { reefs, sites, belts, corals, fishes }
+  return { reefs, sites, belts, corals, fishes, taxa, revisions }
 }
 
 /** 写入结构版本号到 localStorage，便于覆盖度页比对 */

@@ -8,6 +8,7 @@ import { storeToRefs } from 'pinia'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useCatalogStore } from '@/stores/catalogStore'
 import type { BleachLevel, CoralRecord, CoralForm } from '@/types/coralRecord'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
@@ -18,9 +19,9 @@ import {
   coralCoveragePct,
   fishDensity,
   groupByForm,
-  groupByGenus,
   round
 } from '@/utils/bleach'
+import { groupByResolvedGenus, type ResolvedGenusGroup } from '@/utils/catalog'
 
 /** 单条样带的覆盖度成果 */
 export interface BeltCoverage {
@@ -45,8 +46,8 @@ export interface BeltCoverage {
   bleachedSharePct: number
   /** 各白化等级累计覆盖长度 */
   distribution: Record<BleachLevel, number>
-  /** 按属名分组的覆盖长度 */
-  byGenus: Array<{ genus: string; coverCm: number }>
+  /** 按名录定名归并的属名分组（待定名按外业名字照常计入并标出） */
+  byGenus: ResolvedGenusGroup[]
   /** 按形态分组的覆盖长度 */
   byForm: Array<{ form: CoralForm; coverCm: number }>
   fishTotal: number
@@ -117,10 +118,12 @@ export function useCoverage(): UseCoverageResult {
   const reefStore = useReefStore()
   const beltStore = useBeltStore()
   const surveyStore = useSurveyStore()
+  const catalogStore = useCatalogStore()
 
   const { reefs, sites } = storeToRefs(reefStore)
   const { belts } = storeToRefs(beltStore)
   const { corals, fishes } = storeToRefs(surveyStore)
+  const { resolver } = storeToRefs(catalogStore)
 
   const siteOf = (siteId: string) => sites.value.find((site) => site.id === siteId) ?? null
   const reefOf = (reefId: string) => reefs.value.find((reef) => reef.id === reefId) ?? null
@@ -166,7 +169,7 @@ export function useCoverage(): UseCoverageResult {
       grade: bleachGrade(index),
       bleachedSharePct: bleachedSharePct(beltCorals),
       distribution,
-      byGenus: groupByGenus(beltCorals),
+      byGenus: groupByResolvedGenus(beltCorals, resolver.value),
       byForm: groupByForm(beltCorals),
       fishTotal,
       invertebrateTotal,

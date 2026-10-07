@@ -2,7 +2,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 /**
  * 路由表：路径与提示词逐字一致。
- * /reefs、/reefs/:id/sites、/sites/:id/belts、/belts/:id/corals、/belts/:id/fishes、/coverage
+ * /reefs、/reefs/:id/sites、/sites/:id/belts、/belts/:id/corals、/belts/:id/fishes、/coverage、/catalog
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -42,6 +42,12 @@ const routes: RouteRecordRaw[] = [
     name: 'coverage-view',
     component: () => import('@/pages/CoverageView.vue'),
     meta: { title: '白化等级评定与覆盖度汇总', icon: 'PieChart' }
+  },
+  {
+    path: '/catalog',
+    name: 'catalog-view',
+    component: () => import('@/pages/CatalogView.vue'),
+    meta: { title: '分类名录与属名修订', icon: 'Collection' }
   },
   { path: '/:pathMatch(.*)*', redirect: '/reefs' }
 ]

@@ -16,6 +16,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useCatalogStore } from '@/stores/catalogStore'
 import {
   BLEACH_LEVELS,
   COMMON_GENERA,
@@ -23,7 +24,8 @@ import {
   parseCoralPaste
 } from '@/types/coralRecord'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
-import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm, groupByGenus } from '@/utils/bleach'
+import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm } from '@/utils/bleach'
+import { groupByResolvedGenus } from '@/utils/catalog'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -31,6 +33,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const catalogStore = useCatalogStore()
 
 const beltId = computed(() => String(route.params.id ?? ''))
 const belt = computed(() => beltStore.beltById(beltId.value))
@@ -54,14 +57,25 @@ const form = reactive({
 
 const records = computed(() => surveyStore.coralsOfBelt(beltId.value))
 
-/** 按属名分组汇总 */
+/** 属名联想：名录有效属名优先，补足常见属名 */
+const genusOptions = computed<string[]>(() => {
+  const merged = new Set<string>([...catalogStore.acceptedGenera, ...COMMON_GENERA])
+  return Array.from(merged).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+})
+
+/** 按名录定名归并分组（待定名按外业名字照常计入并标出） */
 const genusGroups = computed(() =>
-  groupByGenus(records.value).map((group) => {
-    const list = records.value.filter((record) => record.genus === group.genus)
+  groupByResolvedGenus(records.value, catalogStore.resolver).map((group) => {
+    const list = records.value.filter((record) => catalogStore.resolveGenus(record.genus).name === group.genus)
     const index = bleachIndex(list)
     return { ...group, count: list.length, bleachIndex: index, grade: bleachGrade(index) }
   })
 )
+
+/** 单条记录的名录定名展示（外业原名 → 名录定名 / 待定名） */
+function resolutionOf(genus: string) {
+  return catalogStore.resolveGenus(genus)
+}
 
 /** 按形态分组汇总 */
 const formGroups = computed(() => groupByForm(records.value))
@@ -271,7 +285,8 @@ onMounted(() => {
             <el-tag size="small" type="info" effect="plain">{{ belt.surveyDate }}</el-tag>
           </h2>
           <p class="gb-hint">
-            按属名与形态逐条录入覆盖长度与白化等级；覆盖率 = 覆盖长度合计 / 样带长度，白化指数按覆盖长度加权。
+            按属名与形态逐条录入覆盖长度与白化等级；覆盖率 = 覆盖长度合计 / 样带长度，白化指数按覆盖长度加权；
+            属名按名录定名归并，名录还没改到的按外业名字照常计入并标为「待定名」。
           </p>
         </div>
         <div class="page__actions">
@@ -307,10 +322,13 @@ onMounted(() => {
         </div>
         <div class="page__grid">
           <div>
-            <h4 class="page__sub">按属名分组（覆盖长度 cm）</h4>
+            <h4 class="page__sub">按名录定名归并（覆盖长度 cm）</h4>
             <div class="gb-bars">
               <div v-for="group in genusGroups" :key="group.genus" class="gb-bar">
-                <span>{{ group.genus }}</span>
+                <span>
+                  {{ group.genus }}
+                  <el-tag v-if="group.pending" size="small" type="warning" effect="plain">待定名</el-tag>
+                </span>
                 <span class="gb-bar__track">
                   <span
                     class="gb-bar__fill"
@@ -320,6 +338,9 @@ onMounted(() => {
                 <span class="gb-mono">
                   {{ group.coverCm }} cm · {{ group.count }} 条
                   <BleachTag :level="group.grade" size="small" :plain="true" />
+                </span>
+                <span v-if="group.fieldGenera.some((name) => name !== group.genus)" class="gb-hint page__field-genera">
+                  外业记作：{{ group.fieldGenera.filter((name) => name !== group.genus).join('、') }}
                 </span>
               </div>
             </div>
@@ -373,7 +394,18 @@ onMounted(() => {
             <el-checkbox :model-value="selectedIds.includes(row.id)" @change="() => toggleSelect(row.id)" />
           </template>
         </el-table-column>
-        <el-table-column prop="genus" label="属名" min-width="140" />
+        <el-table-column label="属名" min-width="170">
+          <template #default="{ row }">
+            <div>{{ row.genus }}</div>
+            <div v-if="resolutionOf(row.genus).pending" class="gb-hint">
+              <el-tag size="small" type="warning" effect="plain">待定名</el-tag>
+              按外业名计入
+            </div>
+            <div v-else-if="resolutionOf(row.genus).name !== row.genus" class="gb-hint">
+              名录定名：{{ resolutionOf(row.genus).name }}（v{{ resolutionOf(row.genus).revisionVersion }}）
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column prop="form" label="形态" width="100" />
         <el-table-column label="覆盖长度 (cm)" width="140" align="right">
           <template #default="{ row }">
@@ -413,7 +445,7 @@ onMounted(() => {
         <el-form-item label="属名" required>
           <el-input v-model="form.genus" list="genus-options" placeholder="如：鹿角珊瑚属" maxlength="30" />
           <datalist id="genus-options">
-            <option v-for="genus in COMMON_GENERA" :key="genus" :value="genus"></option>
+            <option v-for="genus in genusOptions" :key="genus" :value="genus"></option>
           </datalist>
         </el-form-item>
         <el-form-item label="形态" required>
@@ -515,6 +547,11 @@ onMounted(() => {
   margin: 0 0 8px;
   font-size: 13px;
   color: #4c6663;
+}
+
+.page__field-genera {
+  flex-basis: 100%;
+  font-size: 11px;
 }
 
 .page__bulk {
